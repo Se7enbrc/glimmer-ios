@@ -60,6 +60,8 @@ jobs:
           XCODE_XCCONFIG_FILE="$RUNNER_TEMP/glimmer-codeql.xcconfig"
           cat > "$XCODE_XCCONFIG_FILE" <<XCCONFIG
           CODE_SIGNING_ALLOWED = NO
+          SWIFT_USE_INTEGRATED_DRIVER = NO
+          OTHER_SWIFT_FLAGS = \$(inherited) -package-name GlimmerCodeQL
           SWIFT_ENABLE_COMPILE_CACHE = NO
           COMPILATION_CACHE_ENABLE_CACHING = NO
           COMPILER_INDEX_STORE_ENABLE = NO
