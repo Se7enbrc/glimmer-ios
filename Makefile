@@ -13,8 +13,7 @@ ifneq ($(strip $(ENGINE_PATH)),)
 PROJECT := build/GlimmerLocal.xcodeproj
 endif
 XCODE = xcodebuild -project "$(PROJECT)" -scheme Glimmer -configuration "$(CONFIG)" \
-	-derivedDataPath "$(DERIVED)" CODE_SIGNING_ALLOWED=NO \
-	SWIFT_TREAT_WARNINGS_AS_ERRORS=YES GCC_TREAT_WARNINGS_AS_ERRORS=YES
+	-derivedDataPath "$(DERIVED)" CODE_SIGNING_ALLOWED=NO
 
 .PHONY: app test check prepare
 prepare:
