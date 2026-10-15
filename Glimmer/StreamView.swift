@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // SPDX-FileCopyrightText: 2026 ugfugl.io
 
+import GameController
 import OSLog
 import SwiftUI
 
@@ -23,10 +24,11 @@ struct StreamView: UIViewControllerRepresentable {
 }
 
 @MainActor
-final class StreamViewController: UIViewController {
+final class StreamViewController: GCEventViewController {
     let model: StreamSessionModel
     let surface = StreamSurface()
     private let overlay: UIHostingController<StreamControls>
+    private var touchCapture: StreamTouchCapture?
     private var screenIdentity: ObjectIdentifier?
 
     init(model: StreamSessionModel, close: @escaping () -> Void) {
@@ -44,22 +46,25 @@ final class StreamViewController: UIViewController {
 
     override func viewDidLoad() {
         super.viewDidLoad()
+        controllerUserInteractionEnabled = true
         view.backgroundColor = .black
         view.addSubview(surface)
+        overlay.overrideUserInterfaceStyle = .dark
         addChild(overlay)
         overlay.view.backgroundColor = .clear
         view.addSubview(overlay.view)
         overlay.didMove(toParent: self)
+        installInputCapture()
     }
 
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
-        updateOrientation(.landscape)
+        updateOrientation()
     }
 
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
-        updateOrientation(.landscape)
+        updateOrientation()
         startWhenReady()
     }
 
@@ -85,15 +90,38 @@ final class StreamViewController: UIViewController {
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
         model.stop()
-        updateOrientation(.allButUpsideDown)
     }
 
-    private func updateOrientation(_ mask: UIInterfaceOrientationMask) {
-        AppDelegate.orientationMask = mask
+    private func installInputCapture() {
+        touchCapture = StreamTouchCapture(view: view, actions: .init(move: { [weak self] delta, time in
+            guard let self else { return }
+            let scale = surface.window?.windowScene?.screen.scale ?? 1
+            model.streamInput?.movePointer(dx: Double(delta.x * scale), dy: Double(delta.y * scale), capturedAt: time)
+        }, scroll: { [weak self] delta, time in
+            guard let self else { return }
+            let scale = surface.window?.windowScene?.screen.scale ?? 1
+            model.streamInput?.scroll(x: Double(-delta.x * scale), y: Double(delta.y * scale),
+                                     precise: true, capturedAt: time)
+        }, click: { [weak model] secondary, time in
+            model?.streamInput?.setPointerButton(secondary ? .right : .left, pressed: true, capturedAt: time)
+            model?.streamInput?.setPointerButton(secondary ? .right : .left, pressed: false, capturedAt: time)
+        }, endScroll: { [weak model] in model?.streamInput?.endScroll() },
+           revealControls: { [weak model] in model?.showControls() }))
+        model.inputCaptureChanged = { [weak self] focused in
+            self?.touchCapture?.setEnabled(focused)
+            self?.controllerUserInteractionEnabled = !focused
+        }
+        surface.accessibilityCustomActions = [UIAccessibilityCustomAction(name: "Show controls") { [weak model] _ in
+            model?.showControls()
+            return true
+        }]
+    }
+
+    private func updateOrientation() {
         guard let scene = view.window?.windowScene else { return }
         scene.windows.first(where: \.isKeyWindow)?.rootViewController?
             .setNeedsUpdateOfSupportedInterfaceOrientations()
-        scene.requestGeometryUpdate(.iOS(interfaceOrientations: mask)) { error in
+        scene.requestGeometryUpdate(.iOS(interfaceOrientations: .landscape)) { error in
             Logger(subsystem: "io.ugfugl.Glimmer", category: "Display")
                 .error("Display rotation failed: \(error.localizedDescription, privacy: .private)")
         }
@@ -104,39 +132,66 @@ final class StreamViewController: UIViewController {
 struct StreamControls: View {
     let model: StreamSessionModel
     let close: () -> Void
-    @State private var controlsVisible = true
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         ZStack {
-            if model.phase == .streaming {
-                Button {
-                    controlsVisible.toggle()
-                } label: {
-                    Color.clear.contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel(controlsVisible ? "Hide stream controls" : "Show stream controls")
-                .ignoresSafeArea()
-            }
             status
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .preferredColorScheme(.dark)
         .safeAreaInset(edge: .top, alignment: .trailing) {
-            if controlsVisible || model.phase != .streaming {
-                Button(model.phase.isEnded ? "Done" : "Disconnect", systemImage: "xmark") {
-                    model.stop()
-                    Task { await model.waitUntilStopped(); close() }
+            if model.controlsVisible || model.phase != .streaming {
+                VStack(alignment: .trailing, spacing: 0) {
+                    controls
+                    if let format = model.requestedFormat {
+                        Text("Requested: \(format.summary)")
+                            .font(.caption).foregroundStyle(.secondary).padding(.horizontal).padding(.bottom)
+                    }
                 }
-                .buttonStyle(.glass)
-                .disabled(model.phase == .stopping)
-                .padding()
-                .accessibilityHint("Disconnects without quitting the game on the PC.")
             }
         }
-        .onChange(of: model.phase) { _, phase in
-            if phase == .streaming { controlsVisible = false }
+        .safeAreaInset(edge: .bottom) {
+            VStack(spacing: 8) {
+                if let message = model.controllerModeMessage, model.inputFocused {
+                    Text(message).font(.callout).padding(8).glassEffect().allowsHitTesting(false)
+                        .transition(.opacity)
+                }
+                if model.waitingForVideo, model.phase == .streaming {
+                    Label("Waiting for video…", systemImage: "clock")
+                        .font(.callout).padding().glassEffect()
+                }
+            }
+            .padding(.bottom, 8)
+            .animation(reduceMotion ? nil : .easeOut(duration: 0.2), value: model.controllerModeMessage)
         }
+        .opacity(model.dismissWhenStopped ? 0 : 1)
+        .allowsHitTesting(!model.dismissWhenStopped)
+        .accessibilityHidden(model.dismissWhenStopped)
+        .onChange(of: model.phase.isEnded && model.dismissWhenStopped, initial: true) { _, finished in
+            if finished { close() }
+        }
+    }
+
+    private var controls: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack { controlActions }
+            VStack(alignment: .trailing) { controlActions }
+        }.padding()
+    }
+
+    @ViewBuilder private var controlActions: some View {
+        if model.phase == .streaming {
+            Button("Resume", systemImage: "play.fill", action: model.resumeInput)
+                .buttonStyle(.glass)
+                .accessibilityHint("Returns controller and touch input to the PC.")
+        }
+        Button(model.phase.isEnded ? "Done" : "Disconnect", systemImage: "xmark") {
+            if model.phase.isEnded { close() } else { model.disconnect() }
+        }
+        .buttonStyle(.glass)
+        .disabled(model.phase == .stopping)
+        .accessibilityHint("Disconnects without quitting the game on the PC.")
     }
 
     @ViewBuilder private var status: some View {
@@ -144,20 +199,30 @@ struct StreamControls: View {
         case .idle, .connecting:
             VStack(spacing: 12) {
                 ProgressView()
-                Text("Connecting to \(model.launch.pcName)…")
+                Text(model.waitingForVideo ? "Waiting for video…" : "Connecting to \(model.launch.pcName)…")
                 Text(model.launch.appName).font(.footnote).foregroundStyle(.secondary)
             }
         case .stopping:
             ProgressView("Disconnecting…")
+        case .reconnecting:
+            ProgressView("Reconnecting to \(model.launch.pcName)…")
         case .ended(let message):
             Text(message).multilineTextAlignment(.center).padding(32)
         case .streaming:
-            if controlsVisible && (model.audioUnavailable || model.connectionPoor) {
-                VStack(spacing: 8) {
-                    if model.audioUnavailable { Label("Audio is unavailable", systemImage: "speaker.slash") }
-                    if model.connectionPoor { Label("Connection is unstable", systemImage: "wifi.exclamationmark") }
+            if model.controlsVisible {
+                ScrollView {
+                    VStack(spacing: 12) {
+                        Text("Hold Menu for a second and release to switch between gamepad and mouse.")
+                        Text(model.launch.mouseStick.controls)
+                        Text("Hold Menu, Options, and both shoulder buttons to disconnect.")
+                        Text("Drag to move the pointer. Tap to click.")
+                        Text("Use two fingers to scroll or tap for a secondary click.")
+                        Text("Tap with three fingers to show these controls.")
+                            .accessibilityHint("VoiceOver users can choose Show controls on the video.")
+                        if model.audioUnavailable { Label("Audio is unavailable", systemImage: "speaker.slash") }
+                        if model.connectionPoor { Label("Connection is unstable", systemImage: "wifi.exclamationmark") }
+                    }.padding(32).multilineTextAlignment(.center)
                 }
-                .padding().background(.regularMaterial, in: .rect(cornerRadius: 12))
             }
         }
     }

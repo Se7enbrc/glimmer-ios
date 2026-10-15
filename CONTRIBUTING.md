@@ -23,10 +23,35 @@ build-tool checks. Read full build logs: zero warnings is required.
 `pre-commit install` is an owner setup step; hooks include verified credential
 and offline private-key scans.
 
+CI also compiles the production Release app for a generic iOS device, without
+signing. It runs alongside Simulator verification; the required `iOS` check
+passes only when both succeed. Compile the same production configuration
+locally:
+
+```sh
+make app CONFIG=Release DESTINATION='generic/platform=iOS' \
+  BUILD_FLAGS='SWIFT_ACTIVE_COMPILATION_CONDITIONS='
+```
+
+Simulator CI records line coverage and retains the report and result bundle in
+`simulator-logs`. This establishes a baseline, not a coverage threshold or
+physical-device acceptance. To record coverage locally, choose an unused result
+bundle path:
+
+```sh
+make test TEST_FLAGS='-enableCodeCoverage YES -resultBundlePath build/coverage.xcresult'
+xcrun xccov view --report build/coverage.xcresult
+```
+
+Swift CodeQL must successfully extract every tracked production Swift file in
+`Glimmer/`. The engine dependency is analyzed in its own repository. Python
+build tools and GitHub Actions receive separate analysis jobs. Hosted extraction
+must pass before treating a local script check as analysis evidence.
+
 ## Engine dependency
 
 The shared project pins `Se7enbrc/glimmer` to the exact commit
-`410e8280defd936f89e21dab61772faea2acdec7`, including the public connection API,
+`d6f4d88effa59e332e03e03768a6ac4b581427cf`, including the public connection API,
 shared transport, audio output contract, video decoder and display pacing. The
 package lock records the same revision. Update the pin to a full commit SHA,
 never a branch or tag, and never copy engine source here.
@@ -69,24 +94,45 @@ The checked-in `Signing.xcconfig` is intentionally blank. The app’s bundle ID 
 provisioning in Xcode before installing. No signing secrets belong in this repo.
 App Store Connect, distribution profiles and release automation come later.
 
+Debug builds keep the active app awake throughout the launcher and stream.
+Production Release keeps it awake only during a stream. For an optimized local
+development build, add
+`SWIFT_ACTIVE_COMPILATION_CONDITIONS = $(inherited) GLIMMER_DEVELOPMENT` on one
+line in the ignored local configuration. Verify production behavior with
+`SWIFT_ACTIVE_COMPILATION_CONDITIONS=''` on the unsigned Release build command.
+Inactive/background scenes always restore auto-lock.
+
 Before accepting UI, inspect light/dark appearance, large Dynamic Type,
 VoiceOver, keyboard focus, iPhone and iPad, both landscape directions, safe-area
-Disconnect button, status/home indicator behavior and portrait restoration after
-streaming. Native UI rendering tests attach PNGs to the test result bundle; CI
-retains those bundles in the `simulator-logs` artifact. Inspect the images
-before claiming visual acceptance.
+Disconnect button, status/home indicator behavior and landscape retention after
+streaming. The whole iPhone app uses both landscape orientations, including the
+launcher, pairing and address entry. iPad declares all orientations for system
+windowing; the app requests landscape without the deprecated fullscreen
+compatibility key. Native UI rendering tests attach PNGs to the test result
+bundle; CI retains those bundles in the `simulator-logs` artifact. Inspect the
+images before claiming visual acceptance.
+
+Pairing recovery must preserve other PCs and reject forgetting during a stream
+or while protected data is unavailable. Verify Cancel, successful forgetting,
+and fresh PIN pairing on a real PC. Certificate failures never delete trust or
+start pairing automatically. Cached cover images remain bounded by the shared
+engine cache; its per-PC removal API is not yet public to this client.
 
 Plug in Backbone One and another controller: verify initial detection, unplug,
-reconnect and background/return. Controller input forwarding is not implemented
-yet. Pairing, hardware decode, audio routing, background/lock teardown and
-sustained play need real-PC and physical-device measurements. The UI rendering
-tests use fake network/session state only and do not prove playback.
+reconnect and background/return. Follow the fixed [input mapping](docs/INPUT.md)
+and validate controller navigation, held-input release and native feedback.
+Pairing, hardware decode, audio routing, background/lock teardown and sustained
+play need real-PC and physical-device measurements. The UI rendering tests use
+fake network/session state only and do not prove playback.
 
 The app opts into
 [higher refresh rates](https://developer.apple.com/documentation/bundleresources/information-property-list/cadisableminimumframedurationonphone)
 and declares the
 [extended gamepad profile](https://developer.apple.com/documentation/bundleresources/information-property-list/gcsupportedgamecontrollers).
-It does not advertise complete controller navigation yet.
+It opts into system-managed Game Mode with `LSSupportsGameMode`, following
+[Apple’s Game Mode guidance](https://developer.apple.com/videos/play/wwdc2025/209/).
+The system controls activation; this declaration does not prove it is active. It
+does not advertise complete controller navigation yet.
 
 ## Repository protection
 

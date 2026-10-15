@@ -50,6 +50,7 @@ final class LauncherServices {
     private let identity: IdentityManager
     private let deviceName: String
     private static let savedKey = "ios.savedPCs"
+    private static let lastConnectedKey = "ios.lastConnectedPCID"
 
     init(defaults: UserDefaults = .standard, base: URL, protectedData: ProtectedDataState,
          deviceName: String = UIDevice.current.name) {
@@ -65,6 +66,24 @@ final class LauncherServices {
         guard protectedData.read() else { throw Failure.unavailable }
         guard let data = defaults.data(forKey: Self.savedKey) else { return [] }
         return try JSONDecoder().decode([SavedPC].self, from: data)
+    }
+
+    func lastConnectedPCID() -> String? {
+        guard protectedData.read() else { return nil }
+        return defaults.string(forKey: Self.lastConnectedKey)
+    }
+
+    func forget(_ id: String) throws -> [SavedPC] {
+        let remaining = try savedPCs().filter { $0.id != id }
+        let encoded = try JSONEncoder().encode(remaining)
+        // Keep the PC listed if its trust cannot be removed, so recovery can be retried.
+        try PinnedCertStore.delete(forHostID: id, defaults: defaults, base: base,
+                                   protectedDataAvailable: { protectedData.read() })
+        defaults.set(encoded, forKey: Self.savedKey)
+        if defaults.string(forKey: Self.lastConnectedKey) == id {
+            defaults.removeObject(forKey: Self.lastConnectedKey)
+        }
+        return remaining
     }
 
     func prepare(server: ServerInfo, saved: Bool) async throws -> PreparedPC {
@@ -109,6 +128,7 @@ final class LauncherServices {
         saved.append(SavedPC(server: pc.server))
         saved.sort { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
         defaults.set(try JSONEncoder().encode(saved), forKey: Self.savedKey)
+        defaults.set(pc.server.uniqueId, forKey: Self.lastConnectedKey)
         return saved
     }
 
@@ -124,6 +144,9 @@ final class LauncherServices {
 
 enum LauncherFailureCopy {
     static func message(_ error: Error) -> String {
+        if case LauncherServices.Failure.missingPin = error {
+            return "Glimmer couldn't use its saved pairing. In Settings → PCs, forget the PC and pair again."
+        }
         if error is IdentityStorageError || error is LauncherServices.Failure {
             return "Glimmer couldn't read or save its pairing with the PC. Unlock the device and try again."
         }
@@ -134,7 +157,8 @@ enum LauncherFailureCopy {
         case .pairingRejected, .pairingFailed:
             return "Pairing failed. Check the PIN in Sunshine on the PC and try again."
         case .hostCertChanged:
-            return "The PC's identity has changed. Glimmer kept the saved pairing and didn't connect."
+            return "The PC's identity has changed. If you reset Sunshine, "
+                + "forget the PC in Settings → PCs and pair again."
         case .sunshineNeedsRestart:
             return "Restart Sunshine on the PC, then try connecting again."
         case .gameStreamHost:

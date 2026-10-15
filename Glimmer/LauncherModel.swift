@@ -22,8 +22,14 @@ final class LauncherModel {
     private(set) var discoveryDenied = false
     private(set) var message: String?
     private(set) var pairing: PairingPrompt?
+    private(set) var pendingForget: SavedPC?
+    private(set) var forgetFailure: String?
+    var canForgetPC: Bool { active && session == nil && !busy }
     var stream: StreamSessionModel?
+    var streamProfile: StreamProfile = .native120
+    var mouseStick: ControllerMouseStick = .right
     private var session: StreamSessionModel?
+    var hasActiveStream: Bool { session.map { !$0.phase.isEnded } ?? false }
     private var closingTask: Task<Void, Never>?
     @MainActor
     struct Calls {
@@ -33,6 +39,9 @@ final class LauncherModel {
         var apps: (PreparedPC) async throws -> [HostApp]
         var remember: (PreparedPC) throws -> [SavedPC]
         var protectedDataChanged: (Bool) -> Void
+        var lastConnectedPCID: () -> String? = { nil }
+        var forget: (String) throws -> [SavedPC] = { _ in throw LauncherServices.Failure.unavailable }
+        var artwork: @Sendable (PreparedPC, Int) async throws -> Data = { try await $0.network.appAsset(appID: $1) }
         var makeSession: @MainActor (StreamLaunch) -> StreamSessionModel = { StreamSessionModel(launch: $0) }
     }
 
@@ -40,10 +49,12 @@ final class LauncherModel {
     private let discoveryEnabled: Bool
     private let discovery = HostDiscovery()
     private var selected: PreparedPC?
+    private var selection: SavedPC?
     private var generation: UInt64 = 0
     private var operation: Task<Void, Never>?
     private var discoveryTask: Task<Void, Never>?
     private var discoveryRun: UInt64?
+    private let artCache = LauncherArtCache(base: URL.cachesDirectory)
     private var active = false
     private var needsRefresh = false
 
@@ -54,7 +65,9 @@ final class LauncherModel {
                   pair: { try await services.pair($0, pin: $1) },
                   apps: { try await $0.network.appList() },
                   remember: { try services.remember($0) },
-                  protectedDataChanged: { services.protectedData.update($0) })
+                  protectedDataChanged: { services.protectedData.update($0) },
+                  lastConnectedPCID: { services.lastConnectedPCID() },
+                  forget: { try services.forget($0) })
         }
         discoveryEnabled = true
         if services == nil { message = "Glimmer couldn't open its storage. Close the app and try again." }
@@ -83,15 +96,64 @@ final class LauncherModel {
             do { savedPCs = try calls?.savedPCs() ?? [] } catch { showStorageFailure() }
             if session == nil { startDiscovery() }
         } else {
+            pendingForget = nil
             stopDiscovery()
             if background || !protectedDataAvailable {
                 cancelOperation()
-                needsRefresh = selected != nil
+                needsRefresh = selection != nil
             }
         }
     }
 
+    func selectInitialPCIfNeeded() {
+        guard active, session == nil, !busy else { return }
+        if needsRefresh, let selection {
+            select(selection)
+        } else if selectedName == nil {
+            let remembered = savedPCs.first { $0.id == calls?.lastConnectedPCID() }
+            if let pc = remembered ?? (savedPCs.count == 1 ? savedPCs.first : nil) { select(pc) }
+        }
+    }
+
     func select(_ pc: SavedPC) { select(server: pc.server, saved: true) }
+
+    func requestForget(_ pc: SavedPC) {
+        guard canForgetPC, savedPCs.contains(where: { $0.id == pc.id }) else { return }
+        forgetFailure = nil
+        pendingForget = pc
+    }
+
+    func cancelForget() { pendingForget = nil }
+
+    func confirmForget(_ pc: SavedPC) {
+        pendingForget = nil
+        guard canForgetPC, savedPCs.contains(where: { $0.id == pc.id }), let calls else { return }
+        do {
+            let remaining = try calls.forget(pc.id)
+            if selection?.id == pc.id || selected?.server.uniqueId == pc.id {
+                cancelOperation()
+                selected = nil
+                selection = nil
+                selectedName = nil
+                apps = []
+                needsRefresh = false
+                message = nil
+            }
+            savedPCs = remaining
+            forgetFailure = nil
+        } catch {
+            forgetFailure = "Couldn't forget \(pc.name). Unlock the device and try again."
+        }
+    }
+
+    func select(address: String) {
+        guard let address = PCAddress.parse(address) else { return }
+        if let saved = savedPCs.first(where: { $0.address.caseInsensitiveCompare(address) == .orderedSame }) {
+            select(saved)
+        } else {
+            select(server: ServerInfo(address: address, uniqueId: "", serverName: address), saved: false)
+        }
+    }
 
     func select(_ pc: HostDiscovery.Discovered) {
         if let saved = savedPCs.first(where: { $0.address == pc.host && $0.httpPort == pc.port }) {
@@ -108,6 +170,8 @@ final class LauncherModel {
         cancelOperation()
         let attempt = generation
         selected = nil
+        selection = saved ? SavedPC(server: server) : nil
+        needsRefresh = false
         selectedName = server.serverName
         apps = []
         busy = true
@@ -132,6 +196,7 @@ final class LauncherModel {
                 guard isCurrent(attempt) else { return }
                 savedPCs = try calls.remember(pc)
                 selected = pc
+                selection = SavedPC(server: pc.server)
                 selectedName = pc.server.serverName
                 apps = list.filter { !$0.hidden }
                 needsRefresh = false
@@ -145,6 +210,23 @@ final class LauncherModel {
         }
     }
 
+    var artworkRevision: String? {
+        guard active, session == nil, !busy, !needsRefresh, let selected else { return nil }
+        return "\(selected.server.uniqueId):\(generation):\(LauncherArtCache.revision(for: apps))"
+    }
+
+    func artwork(for app: HostApp) async -> CGImage? {
+        guard let revision = artworkRevision, let selected, let calls, apps.contains(where: { $0.id == app.id })
+        else { return nil }
+        let fetch = calls.artwork
+        let listRevision = LauncherArtCache.revision(for: apps)
+        let data = await artCache.image(pcID: selected.server.uniqueId, appID: app.id, revision: listRevision) {
+            try await fetch(selected, app.id)
+        }
+        guard !Task.isCancelled, artworkRevision == revision, let data else { return nil }
+        return LauncherArtCache.decode(data)
+    }
+
     func launch(_ app: HostApp) {
         guard active, !busy, session == nil, let selected, let calls else { return }
         if needsRefresh {
@@ -153,7 +235,8 @@ final class LauncherModel {
         }
         stopDiscovery()
         let session = calls.makeSession(StreamLaunch(network: selected.network,
-            pcID: selected.server.uniqueId, pcName: selected.server.serverName, appID: app.id, appName: app.name))
+            pcID: selected.server.uniqueId, pcName: selected.server.serverName, appID: app.id, appName: app.name,
+            profile: streamProfile, mouseStick: mouseStick))
         self.session = session
         stream = session
     }
@@ -168,8 +251,11 @@ final class LauncherModel {
             await session.waitUntilStopped()
             self.session = nil
             closingTask = nil
-            message = "Disconnected. Choose the PC to reconnect."
-            if active { startDiscovery() }
+            message = nil
+            if active {
+                startDiscovery()
+                selectInitialPCIfNeeded()
+            }
         }
     }
 
